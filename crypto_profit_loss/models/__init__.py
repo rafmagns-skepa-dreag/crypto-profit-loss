@@ -5,6 +5,6 @@ engine = create_engine('sqlite:///rich.db')
 Base = declarative_base()
 
 from .user import *
+from .trades import *
 
 Base.metadata.create_all(engine)
-

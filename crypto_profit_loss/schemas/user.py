@@ -1,7 +1,7 @@
-from crypto_profit_loss.models.user import User, Balance, BinanceAcct
 from marshmallow import fields
 from marshmallow_sqlalchemy import ModelSchema
 from sqlalchemy.orm import scoped_session
+from crypto_profit_loss.models.user import User, Balance, BinanceAcct
 from ..database import Session
 
 scoped = scoped_session(Session)
