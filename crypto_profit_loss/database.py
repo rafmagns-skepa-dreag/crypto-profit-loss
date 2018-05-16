@@ -4,6 +4,7 @@ from .models import engine
 
 Session = sessionmaker(bind=engine)  # pylint: disable=invalid-name
 
+
 @contextmanager
 def scoped():
     s = scoped_session(Session)

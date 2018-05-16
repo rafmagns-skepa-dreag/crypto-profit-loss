@@ -9,5 +9,5 @@ setup(
     author='rich',
     author_email='',
     description='',
-    install_requires=['python-binance', 'SQLAlchemy', 'marshmallow-sqlalchemy', 'marshmallow']
+    install_requires=['SQLAlchemy', 'marshmallow', 'marshmallow-sqlalchemy', 'ccxt', 'asyncio-extras']
 )

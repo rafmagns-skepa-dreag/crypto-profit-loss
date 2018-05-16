@@ -1,9 +1,9 @@
-import binance
-from binance.client import Client
+from ccxt.async import binance
 from marshmallow.exceptions import ValidationError
-from .models.user import User, BinanceAcct
-from .schemas import UserSchema, AccountSchema, BalanceSchema
+from .models import User, BinanceAcct, Trade
+from .schemas import UserSchema, AccountSchema, BalanceSchema, TradeSchema
 from .database import scoped
+from asyncio_extras import async_contextmanager
 
 US = UserSchema()
 AS = AccountSchema()
@@ -16,19 +16,28 @@ BS = BalanceSchema()
 # want to compare current value to value paid in underlying
 
 
-def update_user(user_id: int):
+async def update_user(user_id: int):
+    """
+    Fetch a user's account information and balances from Binance and updates it in the database
+    :param user_id: ID for the user that will be updated
+    :return: None
+    """
     with scoped() as s:
         user: User = s.query(User).get(user_id)
         if not user:
             raise KeyError(f'no such user {user_id}')
-        client: Client = Client(user.api_key, user.api_secret)
-        acct: dict = client.get_account()
-        # TODO error checking here
-        acct_sql: BinanceAcct = AS.load(acct).data
+        async with make_binance(user=user) as exchange:
+            try:
+                ret = await exchange.fetch_balance()
+            except Exception as e:
+                raise
+        info = ret['info']
+        balances = info['balances']
+        # # TODO error checking here
+        acct_sql: BinanceAcct = AS.load(info).data
         acct_cached: BinanceAcct = user.account
-        acct_id = None
         if acct_cached:
-            for k in acct.keys():
+            for k in info.keys():
                 if k != 'balances':
                     setattr(acct_cached, k, getattr(acct_sql, k))
             cached_balances = acct_cached.make_balance_dict()
@@ -40,36 +49,42 @@ def update_user(user_id: int):
             cached_balances = {}
             acct_id = acct_sql.id
         s.flush()
-        for balance in acct['balances']:
-            try:
-                parsed_balance = BS.load(balance).data
-            except ValidationError as e:
-                print(e)
-                raise
-            bal = cached_balances.get(parsed_balance.asset)
+        for balance in acct_sql.balances:
+            bal = cached_balances.get(balance.asset)
             if not bal:
-                parsed_balance.account_id = acct_id
-                s.add(parsed_balance)
+                balance.account_id = acct_id
+                s.add(balance)
             else:
                 # these changes should be picked up and be on the session
-                for k in balance.keys():
-                    setattr(bal, k, getattr(parsed_balance, k))
+                for k in balances[0].keys():
+                    setattr(bal, k, getattr(balance, k))
         # TODO generic_commit?
         try:
             s.commit()
         except Exception as e:
             print(e)
+        # print(await get_specific_user_acct_status(user_id))
+
         return
 
 
-def get_specific_user_acct_status(user_id: int):
-    with scoped() as s:
-        user: User = s.query(User).get(user_id)
-        client = Client(user.api_key, user.api_secret)
-        return client.get_account_status()
+async def get_specific_user_acct_status(user_id: int):
+    """
+    Fetch the user's account information and balances from Binance
+    :param user_id: ID of the user
+    :return: dictionary containing user information
+    """
+    async with make_binance(user_id=user_id) as exchange:
+        return await exchange.privateGetAccount()
 
 
-def update_all_trades(user_id, pair):
+async def update_trades(user_id, pair):
+    """
+    Fetches trades for the specified pair for the user and stores them in the database
+    :param user_id: ID of the user who's trades are to be updated
+    :param pair: currency pair (e.g. 'XRP/ETH') to fetch trades for
+    :return:
+    """
     with scoped() as s:
         user: User = s.query(User).get(user_id)
         if not user:
@@ -77,62 +92,99 @@ def update_all_trades(user_id, pair):
         if not user.account:
             update_user(user_id)
             user: User = s.query(User).get(user_id)
-        client = Client(user.api_key, user.api_secret)
-        trades = client.get_my_trades(symbol=pair, fromId=user.account.last_trade)
+
+        async with make_binance(user=user) as exchange:
+            trades = await exchange.fetch_my_trades(symbol=pair)
+
+        if not trades:
+            return
+
         TS = TradeSchema()
+        parsed_trade = None
         for trade in trades:
             if s.query(Trade).get(trade['id']):
                 # trade already exists in the database
                 continue
             try:
-                parsed_trade = TS.load(trade)
+                parsed_trade = TS.load(trade).data
             except ValidationError as e:
                 print(e)
             parsed_trade.account_id = user.account.id
             s.add(parsed_trade)
         # update the most recent trade parsed for the account
-        user.account.last_trade = parsed_trade.id
+        if parsed_trade:
+            user.account.last_trade = parsed_trade.id
+        try:
+            s.commit()
+        except Exception as e:
+            print(e)
+            raise
+
         return
 
 
+async def update_all_trades(user_id: int):
+    """
+    Fetches trades for all currency pairs for the user from the beginning of time and stores them in the database
+    :param user_id: ID of the user to update
+    :return: None
+    """
+    ...
 
-def underlying_to_usdt_at_time(underlying_instrument, time):
+
+async def sync_trades(user_id: int):
     """
-    So we should have the USDT value for things traded against USDT. Everythine
+    Fetches trades all new trades for the user and stores them in the database
+    :param user_id: ID fo the user to update
+    :return: None
     """
-    client = Client('', '')
-    interval = interval_to_milliseconds(Client.KLINE_INTERVAL_1MINUTE)
-    data = client.get_klines(symbol=underlying_instrument, interval=interval, limit=500, startTime=time,
-                             endTime=time+60000)
+    ...
+
+
+async def underlying_to_usdt_at_time(underlying_instrument: str, time: int):
+    """
+    So we should have the USDT value for things traded against USDT. Everything
+    :param underlying_instrument: Instrument to query against
+    :param time: Epoch time to fetch the price at
+    :return: price data at specified time
+    """
+    with make_binance(api_key='', api_secret='') as exchange:
+        data = await exchange.fetch_ohlcv(symbol=underlying_instrument, params={'startTime': time})
+    # data = client.get_klines(symbol=underlying_instrument, interval=interval, limit=500, startTime=time,
+    #                          endTime=time+60000)
     print(data)
+    return data
+
 
 def get_profit_loss(trade):
     instrument = trade.pair[:3]
     underlying = trade.pair[3:]
     ...
 
-# Thanks to samchardy.github.io for this ftn
-def interval_to_milliseconds(interval):
-    """Convert a Binance interval string to milliseconds
-    :param interval: Binance interval string 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w
-    :type interval: str
-    :return:
-         None if unit not one of m, h, d or w
-         None if string not in correct format
-         int value of interval in milliseconds
-    """
-    ms = None
-    seconds_per_unit = {
-        "m": 60,
-        "h": 60 * 60,
-        "d": 24 * 60 * 60,
-        "w": 7 * 24 * 60 * 60
-    }
 
-    unit = interval[-1]
-    if unit in seconds_per_unit:
-        try:
-            ms = int(interval[:-1]) * seconds_per_unit[unit] * 1000
-        except ValueError:
-            pass
-    return ms
+@async_contextmanager
+async def make_binance(user: User = None, user_id: int = None, api_key: str = None, api_secret: str = None):
+    """
+    Yields a Binance exchange object and cleans up afterward
+    :param user: user object to get api information from
+    :param user_id: ID to look up in the database for api information
+    :param api_key: API key
+    :param api_secret: API secret
+    :return: None
+    """
+    key = api_key
+    secret = api_secret
+    if user:
+        key = user.api_key
+        secret = user.api_secret
+    elif user_id:
+        with scoped() as s:
+            user: User = s.query(User).get(user_id)
+            if user:
+                key = user.api_key
+                secret = user.api_secret
+
+    exchange = binance({'apiKey': key, 'secret': secret, 'enableRateLimit': True,
+                        'options': {'adjustForTimeDifference': True}})
+    yield exchange
+    await exchange.close()
